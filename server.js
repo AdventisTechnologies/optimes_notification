@@ -229,13 +229,44 @@ function buildMessage(title, body, link, extraData = {}) {
     }
   });
 
-  // Web browsers cannot subscribe to a topic themselves, so the server does it
+  // Web browsers cannot subscribe to a topic themselves, so the server does it.
+  // NOTE: subscribeToTopic does NOT throw when a token fails. It returns a
+  // failureCount, so we check it and report the real reason.
   app.post('/register', async (req, res) => {
     try {
       const token = req.body && req.body.token;
       if (!token) return res.status(400).json({ error: 'token missing' });
-      await getMessaging().subscribeToTopic(token, 'alerts');
-      console.log('Web device registered');
+
+      const r = await getMessaging().subscribeToTopic(token, 'alerts');
+      if (r.failureCount > 0) {
+        const err = r.errors && r.errors[0] && r.errors[0].error;
+        const msg = err ? `${err.code || ''} ${err.message || ''}`.trim() : 'subscribe failed';
+        console.error('Subscribe failed:', msg);
+        return res.status(500).json({ error: msg });
+      }
+      console.log('Web device registered and subscribed to alerts');
+
+      // Optional proof: set DEBUG_WELCOME=1 in Render to send a direct
+      // "Notifications enabled" push to the device that just registered.
+      if (process.env.DEBUG_WELCOME === '1') {
+        try {
+          const welcome = {
+            token,
+            notification: {
+              title: 'Notifications enabled',
+              body: 'You will now receive Optimes alerts',
+            },
+          };
+          if (SITE.startsWith('https://')) {
+            welcome.webpush = { fcmOptions: { link: SITE } };
+          }
+          const id = await getMessaging().send(welcome);
+          console.log('Welcome sent:', id);
+        } catch (e) {
+          console.error('Welcome failed:', e.code || '', e.message);
+        }
+      }
+
       res.json({ ok: true });
     } catch (e) {
       console.error('Register failed:', e.message);

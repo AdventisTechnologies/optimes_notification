@@ -112,7 +112,7 @@ function format(collection, d) {
   };
 }
 
-// Builds one push message for the "alerts" topic (Android, iPhone app and web)
+// Push message for the "alerts" topic (used by the Android / iPhone apps)
 function buildMessage(title, body, link, extraData = {}) {
   const message = {
     topic: 'alerts',
@@ -121,7 +121,6 @@ function buildMessage(title, body, link, extraData = {}) {
     android: { priority: 'high' },
     apns: { payload: { aps: { sound: 'default' } } },
   };
-  // Web push: clicking the notification opens the link (must be https)
   if (link && link.startsWith('https://')) {
     message.webpush = { fcmOptions: { link } };
   }
@@ -134,6 +133,47 @@ function buildMessage(title, body, link, extraData = {}) {
   console.log('MongoDB connected');
 
   const notifyCol = client.db('optimes_notify').collection('notifications');
+  // Web browsers / iPhone web apps are stored here and messaged directly
+  const tokensCol = client.db('optimes_notify').collection('web_tokens');
+  await tokensCol.createIndex({ token: 1 }, { unique: true });
+
+  const DEAD_CODES = [
+    'messaging/registration-token-not-registered',
+    'messaging/invalid-registration-token',
+    'messaging/mismatched-credential',
+  ];
+
+  // Sends to every saved web token directly (no topic subscription needed)
+  async function sendToWeb(title, body, link, data = {}) {
+    const docs = await tokensCol.find().toArray();
+    const tokens = docs.map((d) => d.token);
+    if (!tokens.length) {
+      console.log('Web push: no web devices registered');
+      return;
+    }
+    for (let i = 0; i < tokens.length; i += 500) {
+      const chunk = tokens.slice(i, i + 500);
+      const message = {
+        tokens: chunk,
+        notification: { title, body },
+        data: { link: String(link || ''), ...data },
+      };
+      if (link && link.startsWith('https://')) {
+        message.webpush = { fcmOptions: { link } };
+      }
+      const r = await getMessaging().sendEachForMulticast(message);
+      const dead = [];
+      r.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          const code = resp.error && resp.error.code;
+          console.error('Web send failed:', code, resp.error && resp.error.message);
+          if (DEAD_CODES.includes(code)) dead.push(chunk[idx]);
+        }
+      });
+      if (dead.length) await tokensCol.deleteMany({ token: { $in: dead } });
+      console.log(`Web push: ${r.successCount} ok, ${r.failureCount} failed`);
+    }
+  }
 
   async function handle(ch, dbName, name) {
     try {
@@ -153,6 +193,7 @@ function buildMessage(title, body, link, extraData = {}) {
       const title = isUpdate ? `Status update: ${f.title}` : f.title;
       const body = f.message || 'Tap to view details';
       const link = SITE + f.path;
+      const extra = { category: String(f.category), id: String(d._id) };
 
       await notifyCol.insertOne({
         db: dbName,
@@ -165,10 +206,12 @@ function buildMessage(title, body, link, extraData = {}) {
         createdAt: new Date(),
       });
 
-      const id = await getMessaging().send(
-        buildMessage(title, body, link, { category: String(f.category), id: String(d._id) })
-      );
+      // Android / iPhone apps (topic)
+      const id = await getMessaging().send(buildMessage(title, body, link, extra));
       console.log('Sent:', `${dbName}.${name}`, '-', title, '| fcm id:', id);
+
+      // Web / iPhone web app (direct to saved tokens)
+      await sendToWeb(title, body, link, extra);
     } catch (e) {
       console.error('Send failed:', e.message);
     }
@@ -229,22 +272,30 @@ function buildMessage(title, body, link, extraData = {}) {
     }
   });
 
-  // Web browsers cannot subscribe to a topic themselves, so the server does it.
-  // NOTE: subscribeToTopic does NOT throw when a token fails. It returns a
-  // failureCount, so we check it and report the real reason.
+  // Web browsers register here. The token is checked against this Firebase
+  // project (dry run), then saved so alerts can be sent to it directly.
   app.post('/register', async (req, res) => {
     try {
       const token = req.body && req.body.token;
       if (!token) return res.status(400).json({ error: 'token missing' });
 
-      const r = await getMessaging().subscribeToTopic(token, 'alerts');
-      if (r.failureCount > 0) {
-        const err = r.errors && r.errors[0] && r.errors[0].error;
-        const msg = err ? `${err.code || ''} ${err.message || ''}`.trim() : 'subscribe failed';
-        console.error('Subscribe failed:', msg);
+      try {
+        await getMessaging().send(
+          { token, notification: { title: 'check', body: 'check' } },
+          true // dry run: nothing is delivered
+        );
+      } catch (e) {
+        const msg = `${e.code || ''} ${e.message || ''}`.trim();
+        console.error('Register check failed:', msg);
         return res.status(500).json({ error: msg });
       }
-      console.log('Web device registered and subscribed to alerts');
+
+      await tokensCol.updateOne(
+        { token },
+        { $set: { token, updatedAt: new Date() } },
+        { upsert: true }
+      );
+      console.log('Web device registered:', token.slice(0, 12) + '...');
 
       // Optional proof: set DEBUG_WELCOME=1 in Render to send a direct
       // "Notifications enabled" push to the device that just registered.
@@ -281,10 +332,11 @@ function buildMessage(title, body, link, extraData = {}) {
       return res.status(403).send('Forbidden');
     }
     try {
-      const id = await getMessaging().send(
-        buildMessage('Test alert', 'If you see this, push notifications work', SITE)
-      );
+      const title = 'Test alert';
+      const body = 'If you see this, push notifications work';
+      const id = await getMessaging().send(buildMessage(title, body, SITE));
       console.log('Test sent | fcm id:', id);
+      await sendToWeb(title, body, SITE);
       res.send('Test notification sent: ' + id);
     } catch (e) {
       console.error('Test failed:', e.message);
